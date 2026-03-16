@@ -1,0 +1,67 @@
+name: Build and release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: time_convolver
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: time_convolver
+            asset_name: time_convolver-linux-x86_64
+          - os: macos-latest
+            artifact_name: time_convolver
+            asset_name: time_convolver-macos-x86_64_or_arm64
+          - os: windows-latest
+            artifact_name: time_convolver.exe
+            asset_name: time_convolver-windows-x86_64.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Rust version
+        run: rustc --version
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Prepare asset (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir dist
+          cp target/release/${{ matrix.artifact_name }} dist/${{ matrix.asset_name }}
+          chmod +x dist/${{ matrix.asset_name }}
+
+      - name: Prepare asset (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/release/${{ matrix.artifact_name }}" "dist/${{ matrix.asset_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+
+      - name: Upload asset to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.asset_name }}
