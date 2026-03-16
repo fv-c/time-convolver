@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,22 +15,40 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.os }}
+    name: Build ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            artifact_name: time_convolver
-            asset_name: time_convolver-linux-x86_64
-          - os: macos-latest
-            artifact_name: time_convolver
-            asset_name: time_convolver-macos-x86_64_or_arm64
-          - os: windows-latest
-            artifact_name: time_convolver.exe
-            asset_name: time_convolver-windows-x86_64.exe
+          - label: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin_path: target/x86_64-unknown-linux-gnu/release/time_convolver
+            asset_stem: time_convolver-linux-x86_64
+            archive_ext: tar.gz
+
+          - label: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            bin_path: target/x86_64-apple-darwin/release/time_convolver
+            asset_stem: time_convolver-macos-x86_64
+            archive_ext: tar.gz
+
+          - label: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bin_path: target/aarch64-apple-darwin/release/time_convolver
+            asset_stem: time_convolver-macos-aarch64
+            archive_ext: tar.gz
+
+          - label: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_path: target/x86_64-pc-windows-msvc/release/time_convolver.exe
+            asset_stem: time_convolver-windows-x86_64
+            archive_ext: zip
 
     steps:
       - name: Checkout
@@ -38,30 +57,61 @@ jobs:
       - name: Show Rust version
         run: rustc --version
 
-      - name: Build release
-        run: cargo build --release
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
 
-      - name: Prepare asset (Linux/macOS)
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Show build directory (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: ls -la $(dirname "${{ matrix.bin_path }}")
+
+      - name: Show build directory (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Get-ChildItem (Split-Path "${{ matrix.bin_path }}")
+
+      - name: Prepare packaged asset (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
-          mkdir dist
-          cp target/release/${{ matrix.artifact_name }} dist/${{ matrix.asset_name }}
-          chmod +x dist/${{ matrix.asset_name }}
+          mkdir -p dist
+          cp "${{ matrix.bin_path }}" "dist/${{ env.BIN_NAME }}"
+          chmod +x "dist/${{ env.BIN_NAME }}"
+          tar -czf "dist/${{ matrix.asset_stem }}.tar.gz" -C dist "${{ env.BIN_NAME }}"
 
-      - name: Prepare asset (Windows)
+      - name: Prepare packaged asset (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target/release/${{ matrix.artifact_name }}" "dist/${{ matrix.asset_name }}"
+          Copy-Item "${{ matrix.bin_path }}" "dist/${{ env.BIN_NAME }}.exe"
+          Compress-Archive -Path "dist/${{ env.BIN_NAME }}.exe" -DestinationPath "dist/${{ matrix.asset_stem }}.zip"
 
-      - name: Upload artifact
+      - name: Generate SHA256 checksum (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          shasum -a 256 "dist/${{ matrix.asset_stem }}.${{ matrix.archive_ext }}" > "dist/${{ matrix.asset_stem }}.${{ matrix.archive_ext }}.sha256"
+
+      - name: Generate SHA256 checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "dist/${{ matrix.asset_stem }}.${{ matrix.archive_ext }}" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.asset_stem }}.${{ matrix.archive_ext }}" | Out-File -Encoding ascii "dist/${{ matrix.asset_stem }}.${{ matrix.archive_ext }}.sha256"
+
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: dist/${{ matrix.asset_name }}
+          name: ${{ matrix.asset_stem }}
+          path: |
+            dist/${{ matrix.asset_stem }}.${{ matrix.archive_ext }}
+            dist/${{ matrix.asset_stem }}.${{ matrix.archive_ext }}.sha256
 
-      - name: Upload asset to GitHub Release
+      - name: Upload assets to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ matrix.asset_name }}
+          files: |
+            dist/${{ matrix.asset_stem }}.${{ matrix.archive_ext }}
+            dist/${{ matrix.asset_stem }}.${{ matrix.archive_ext }}.sha256
+          generate_release_notes: true
