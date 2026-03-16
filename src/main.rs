@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use ebur128::{EbuR128, Mode};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -13,14 +13,28 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+mod gui;
+mod errors;
+
+pub use errors::GuiError;
+
+#[derive(Subcommand, Debug, Clone)]
+enum Command {
+    /// Launch the GUI application
+    Gui,
+}
+
 #[derive(Parser, Debug)]
 #[command(version, about, arg_required_else_help = true)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     #[arg(long, value_name = "INPUT")]
-    input: PathBuf,
+    input: Option<PathBuf>,
 
     #[arg(long, value_name = "OUTPUT")]
-    output: PathBuf,
+    output: Option<PathBuf>,
 
     #[arg(long, value_name = "KERNEL")]
     kernel: Option<PathBuf>,
@@ -78,20 +92,29 @@ struct AudioStats {
     global_peak: f32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LoudnessReport {
     integrated_lufs: f64,
     true_peak_dbfs: Option<f64>,
 }
 
-fn main() -> Result<()> {
+fn main() -> anyhow::Result<()> {
+    let mut args = Args::parse();
 
-    let args = Args::parse();
+    // Check if GUI mode is requested
+    if matches!(args.command, Some(Command::Gui)) {
+        return Ok(gui::run_gui(&mut args)?);
+    }
+
     print_usage_examples();
+
+    // Validate required CLI arguments
+    let input_path = args.input.ok_or_else(|| anyhow!("--input is required"))?;
+    let output_path = args.output.ok_or_else(|| anyhow!("--output is required"))?;
 
     println!("Caricamento file...");
 
-    let mut a = load_audio(&args.input)?;
+    let mut a = load_audio(&input_path)?;
 
     println!("Input  : sr={} ch={} len={}", a.sample_rate, a.channels, a.data[0].len());
     print_audio_stats("Input originale", &analyze_audio(&a.data));
@@ -109,7 +132,7 @@ fn main() -> Result<()> {
         run_self_convolution_stages(
             &a,
             stages,
-            &args.output,
+            &output_path,
             args.save_intermediate_stages,
         )?
     } else {
@@ -130,11 +153,11 @@ fn main() -> Result<()> {
         let target_sr = a.sample_rate.max(b.sample_rate);
 
         if a.sample_rate != target_sr {
-            a = resample_audio_cubic(&a, target_sr)?;
+            a = resample_audio(&a, target_sr)?;
         }
 
         if b.sample_rate != target_sr {
-            b = resample_audio_cubic(&b, target_sr)?;
+            b = resample_audio(&b, target_sr)?;
         }
 
         println!("Convoluzione time-domain in corso...");
@@ -172,9 +195,9 @@ fn main() -> Result<()> {
     let loud_after = measure_loudness(&out, target_sr, args.report_true_peak)?;
     print_loudness_report("Loudness output finale", &loud_after);
 
-    write_wav_f32(&args.output, target_sr, &out)?;
+    write_wav_f32(&output_path, target_sr, &out)?;
 
-    println!("Fatto: {}", args.output.display());
+    println!("Fatto: {}", output_path.display());
 
     Ok(())
 }
@@ -201,17 +224,23 @@ fn run_self_convolution_stages(
 
         let convolved = convolve_multichannel_time_domain_with_progress(&current, &current);
 
+        // Normalizza per evitare overflow dopo multiple convoluzioni
+        let mut normalized_data: Vec<Vec<f32>> = Vec::with_capacity(convolved.len());
+        for ch in &convolved {
+            let mut normalized_ch = ch.clone();
+            normalize_peak_single_channel(&mut normalized_ch, 0.9);
+            normalized_data.push(normalized_ch);
+        }
+
         current = AudioData {
             sample_rate: current.sample_rate,
-            channels: convolved.len(),
-            data: convolved,
+            channels: normalized_data.len(),
+            data: normalized_data,
         };
 
         if save_intermediate_stages {
             let stage_path = build_stage_output_path(final_output_path, stage_idx);
-            let mut stage_data = current.data.clone();
-            normalize_peak_in_place(&mut stage_data, 0.999);
-            write_wav_f32(&stage_path, current.sample_rate, &stage_data)?;
+            write_wav_f32(&stage_path, current.sample_rate, &current.data)?;
             println!("Salvato stadio intermedio: {}", stage_path.display());
         }
     }
@@ -311,64 +340,26 @@ fn load_audio(path: &Path) -> Result<AudioData> {
     })
 }
 
-fn resample_audio_cubic(audio: &AudioData, target_sr: u32) -> Result<AudioData> {
+fn resample_audio(audio: &AudioData, target_sr: u32) -> Result<AudioData> {
+    use rubato::{FftFixedIn, Resampler};
 
-    let ratio = target_sr as f64 / audio.sample_rate as f64;
+    let len = audio.data[0].len();
+    let mut resampler = FftFixedIn::<f32>::new(
+        audio.sample_rate as usize,
+        target_sr as usize,
+        len,
+        1,
+        1,
+    )?;
 
-    let mut out = Vec::new();
-
-    for ch in 0..audio.channels {
-        out.push(resample_channel_cubic(&audio.data[ch], ratio));
-    }
+    let input_vec: Vec<Vec<f32>> = audio.data.clone();
+    let resampled = resampler.process(&input_vec, None)?;
 
     Ok(AudioData {
         sample_rate: target_sr,
         channels: audio.channels,
-        data: out,
+        data: resampled,
     })
-}
-
-fn resample_channel_cubic(input: &[f32], ratio: f64) -> Vec<f32> {
-
-    let out_len = (input.len() as f64 * ratio) as usize;
-
-    let mut out = Vec::with_capacity(out_len);
-
-    for i in 0..out_len {
-        let src = i as f64 / ratio;
-        out.push(cubic_sample(input, src));
-    }
-
-    out
-}
-
-fn cubic_sample(x: &[f32], pos: f64) -> f32 {
-
-    let i = pos.floor() as isize;
-    let t = (pos - i as f64) as f32;
-
-    let y0 = get_clamped(x, i - 1);
-    let y1 = get_clamped(x, i);
-    let y2 = get_clamped(x, i + 1);
-    let y3 = get_clamped(x, i + 2);
-
-    let a0 = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
-    let a1 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
-    let a2 = -0.5 * y0 + 0.5 * y2;
-    let a3 = y1;
-
-    ((a0 * t + a1) * t + a2) * t + a3
-}
-
-fn get_clamped(x: &[f32], i: isize) -> f32 {
-
-    if i < 0 {
-        x[0]
-    } else if (i as usize) >= x.len() {
-        x[x.len() - 1]
-    } else {
-        x[i as usize]
-    }
 }
 
 fn convolve_multichannel_time_domain_with_progress(
@@ -567,6 +558,17 @@ fn normalize_peak_in_place(channels: &mut [Vec<f32>], target: f32) {
             for s in ch {
                 *s *= gain;
             }
+        }
+    }
+}
+
+fn normalize_peak_single_channel(data: &mut Vec<f32>, target: f32) {
+    let peak = data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+
+    if peak > 0.0 {
+        let gain = target / peak;
+        for s in data {
+            *s *= gain;
         }
     }
 }
