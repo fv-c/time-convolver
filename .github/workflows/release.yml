@@ -100,6 +100,31 @@ jobs:
           $hash = (Get-FileHash "dist/${{ matrix.asset_stem }}.${{ matrix.archive_ext }}" -Algorithm SHA256).Hash.ToLower()
           "$hash  ${{ matrix.asset_stem }}.${{ matrix.archive_ext }}" | Out-File -Encoding ascii "dist/${{ matrix.asset_stem }}.${{ matrix.archive_ext }}.sha256"
 
+      - name: Network diagnostics (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          echo "Runner name: $RUNNER_NAME"
+          echo "Runner OS: $RUNNER_OS"
+          echo "Testing github.com"
+          curl -I https://github.com || true
+          echo "Testing api.github.com"
+          curl -I https://api.github.com || true
+          echo "DNS github.com"
+          nslookup github.com || true
+          echo "DNS api.github.com"
+          nslookup api.github.com || true
+
+      - name: Network diagnostics (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Write-Host "Runner name: $env:RUNNER_NAME"
+          Write-Host "Runner OS: $env:RUNNER_OS"
+          try { Invoke-WebRequest https://github.com -Method Head | Out-Null; Write-Host "github.com OK" } catch { Write-Host $_ }
+          try { Invoke-WebRequest https://api.github.com -Method Head | Out-Null; Write-Host "api.github.com OK" } catch { Write-Host $_ }
+          nslookup github.com
+          nslookup api.github.com
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
