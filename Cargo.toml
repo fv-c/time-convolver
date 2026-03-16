@@ -1,0 +1,12 @@
+[package]
+name = "time_convolver"
+version = "0.3.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hound = "3.5"
+indicatif = "0.18"
+symphonia = { version = "0.5.5", features = ["all"] }
+ebur128 = "0.1.10"
